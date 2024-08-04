@@ -1,12 +1,14 @@
 from django.shortcuts import render
 from django.http import JsonResponse
-from django.db import transaction
 from uuid import UUID
 from .models import User
 import json
 import requests
 import os
 from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
+import threading
+import time
 
 # Create your views here.
 
@@ -37,26 +39,42 @@ def api(request):
 
 def get_progress(user_id):
     try:
+        user = User.objects.get(id=user_id)
+        data = json.loads(user.json)
+        data['progress'] = user.progress
 
-        user = User.objects.select_for_update().get(id=user_id)
-        return JsonResponse({'progress': user.progress}, status=200)
+        if data['status'] != 200:
+            return JsonResponse(data, status=409)
+
+        return JsonResponse(data, status=200)
 
     except User.DoesNotExist:
         return JsonResponse({}, status=404)
 
 
 def get_weather(user_id, cities):
-    api_key = os.environ.get("API_KEY")
-
     if len(User.objects.filter(id=user_id)) > 0:
         return JsonResponse({'message': 'User already exists'}, status=409)
 
-    user = User.objects.create(id=user_id, cities=cities)
+    user = User.objects.create(id=user_id, date=timezone.now())
+    user.json = '{"status": 200, "cities": []}'
+    user.save()
+
+    worker = threading.Thread(
+            target=get_weather_background,
+            args=(user_id, cities, True)
+            )
+    worker.start()
+
+    return JsonResponse({}, status=202)
+
+
+def get_weather_background(user_id, cities, wait=False):
+    api_key = os.environ.get("API_KEY")
 
     i = 0
     step = 20
-
-    rval = { "cities": [] }
+    rval = { "status": 200, "cities": [] }
 
     while i < len(cities):
         step = min(step, len(cities) - i)
@@ -70,9 +88,14 @@ def get_weather(user_id, cities):
         i += step
 
         resp = requests.get(url, params=params)
+        rval['status'] = resp.status_code
         if resp.status_code != 200:
-            user.delete()
-            return JsonResponse(resp.json(), status=resp.status_code)
+            user = User.objects.get(id=user_id)
+            user.progress = i / len(cities) * 100
+            rval['body'] = resp.json()
+            user.json = json.dumps(rval)
+            user.save()
+            return
 
         data = resp.json()
 
@@ -89,9 +112,11 @@ def get_weather(user_id, cities):
                     }
             rval['cities'].append(city)
 
-        with transaction.atomic():
-            user = User.objects.select_for_update().get(id=user_id)
-            user.progress = i / len(cities) * 100
-            user.save()
+        user = User.objects.get(id=user_id)
+        user.progress = i / len(cities) * 100
+        user.json = json.dumps(rval)
+        user.save()
 
-    return JsonResponse(rval, status=200)
+        if wait:
+            time.sleep(20)  # ensures that 60 cities are queried per minute
+
